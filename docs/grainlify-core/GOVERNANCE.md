@@ -215,6 +215,63 @@ Emitted when a migration run finishes (emitted both on success and failure to pr
   - `success: bool` — Whether the migration completed successfully.
   - `error_message: Option<String>` — Error description if the migration failed.
 
+## Cross-Contract Consumption by Escrow Contracts
+
+Both `bounty_escrow` and `program-escrow` integrate with `grainlify-core`
+**exclusively through the governance side** of `GrainlifyContract`. Neither
+escrow contract calls any multisig entrypoint.
+
+Each escrow crate ships a `governance_integration.rs` module that declares a
+cross-contract interface using Soroban's `#[contractclient]` macro:
+
+```rust
+#[contractclient(name = "GovernanceClient")]
+trait GovernanceInterface {
+    fn get_ver(env: Env) -> u32;
+    fn is_upg_ok(env: Env, wasm_hash: BytesN<32>) -> bool;
+    // bounty_escrow also calls:
+    fn get_version_numeric_encoded(env: Env) -> u32;
+}
+```
+
+### Methods called and their mapping
+
+| Method | `GrainlifyContract` entrypoint | Purpose |
+|---|---|---|
+| `get_ver()` | `get_ver()` → `get_version()` | Version liveness check. Ensures the governance contract is reachable and meets a configurable `min_governance_version` before an upgrade gate is evaluated. |
+| `is_upg_ok(wasm_hash)` | `is_upg_ok(wasm_hash)` → `GovernanceContract::is_upgrade_approved` | Returns `true` only when an `Executed`, post-delay governance proposal for `wasm_hash` exists. Escrow contracts call this to gate any self-upgrade. |
+| `get_version_numeric_encoded()` | `get_version_numeric_encoded()` | Used by `bounty_escrow` to enforce a minimum semantic-version gate (`major * 10_000 + minor * 100 + patch`). Not called by `program-escrow`. |
+
+### Integration call path
+
+```text
+bounty_escrow / program-escrow
+  └── governance_integration::check_upgrade_approval(env, wasm_hash)
+          │
+          │  cross-contract call via GovernanceClient
+          ▼
+      GrainlifyContract::is_upg_ok(wasm_hash)
+          │
+          ▼
+      GovernanceContract::is_upgrade_approved(wasm_hash)
+          └── scans proposals for Executed status + matching hash + elapsed delay
+```
+
+### Architecture boundary
+
+The escrow contracts do **not** need to know whether `grainlify-core` was
+configured with governance, multisig, or single-admin upgrade paths. They only
+ask "has governance approved this hash?" via `is_upg_ok`. The multisig and
+single-admin paths are entirely internal to `grainlify-core`.
+
+This boundary means:
+
+- Escrow contracts are unaffected by changes to multisig signer config.
+- `grainlify-core` can be upgraded via any path without breaking escrow
+  governance checks, as long as `is_upg_ok` and `get_ver` remain available.
+- A misconfigured escrow that calls multisig entrypoints directly would bypass
+  the democratic governance record and should be treated as a security defect.
+
 ## TODO / Future Enhancements
 
 - [ ] Integrate with a native Soroban token for precise `TokenWeighted` voting power.

@@ -522,3 +522,76 @@ fn test_reentrancy_guard_model_documentation() {
 
     assert!(true, "Documentation test - see comments for guarantees");
 }
+
+
+// ============================================================================
+// Token Callback Reentrancy Tests
+// ============================================================================
+
+#[test]
+#[should_panic(expected = "Reentrancy detected")]
+fn test_token_callback_reentrancy_single_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    let authorized_key = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let program_id = String::from_str(&env, "test-program");
+    let amount = 1000_0000000i128;
+
+    // Register our malicious reentrant contract and use it as the token
+    let token_address = env.register_contract(None, crate::malicious_reentrant::MaliciousReentrantContract);
+    let malicious_token = crate::malicious_reentrant::MaliciousReentrantContractClient::new(&env, &token_address);
+    malicious_token.init(&contract_id);
+    malicious_token.set_attack_mode(&1u32); // 1 = attack single_payout
+
+    client.init_program(&program_id, &authorized_key, &token_address);
+    
+    malicious_token.set_attack_mode(&0u32);
+    // Lock funds with normal mode
+    client.lock_program_funds(&authorized_key, &amount);
+    
+    // Now enable attack mode before payout
+    malicious_token.set_attack_mode(&1u32);
+    malicious_token.reset_attack_count();
+
+    // This should panic when it calls transfer() on our malicious token
+    client.single_payout(&recipient, &(amount / 2));
+}
+
+#[test]
+#[should_panic(expected = "Reentrancy detected")]
+fn test_token_callback_reentrancy_trigger_releases() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    let authorized_key = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let program_id = String::from_str(&env, "test-program");
+    let amount = 1000_0000000i128;
+    let release_timestamp = 1000u64;
+
+    let token_address = env.register_contract(None, crate::malicious_reentrant::MaliciousReentrantContract);
+    let malicious_token = crate::malicious_reentrant::MaliciousReentrantContractClient::new(&env, &token_address);
+    malicious_token.init(&contract_id);
+    malicious_token.set_attack_mode(&0u32); 
+
+    client.init_program(&program_id, &authorized_key, &token_address);
+    client.lock_program_funds(&authorized_key, &amount);
+    client.create_program_release_schedule(&amount, &release_timestamp, &recipient);
+
+    env.ledger().set_timestamp(release_timestamp + 1);
+
+    // Enable attack mode 3 = attack trigger_program_releases
+    malicious_token.set_attack_mode(&3u32);
+    malicious_token.reset_attack_count();
+
+    // This should panic when it calls transfer()
+    client.trigger_program_releases();
+}

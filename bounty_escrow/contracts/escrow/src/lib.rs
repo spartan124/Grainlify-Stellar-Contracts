@@ -3568,3 +3568,5 @@ mod test_reentrancy;
 
 #[cfg(test)]
 mod test_balance_invariant;
+#[cfg(test)]
+mod test_upgrade_scenarios;

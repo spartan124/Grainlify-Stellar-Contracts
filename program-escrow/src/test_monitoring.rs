@@ -240,13 +240,74 @@ fn test_large_payout_threshold_respects_custom_bps() {
     assert_eq!(threshold, 25_000);
 }
 
-// Rolling-window / rapid-successive-claims criterion (issue #192):
-// monitoring.rs has no rolling window or rate-of-claims tracking. This is a
-// documented gap, not a regression — the module only supports the large-payout
-// threshold check above. Left as `#[ignore]` so it surfaces as "skipped" rather
-// than silently passing.
+// Rolling-window / metric decay and alert clearing tests (issue #238)
 #[test]
-#[ignore]
-fn test_rolling_window_reset_behavior() {
-    panic!("monitoring.rs does not implement a rolling window / rapid-claims detector");
+fn test_metric_decay_and_alert_clearing() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    // Initial state: healthy
+    assert_eq!(client.health_check().is_healthy, true);
+
+    // Setup program for operations
+    let admin = Address::generate(&env);
+    let tokenadmin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(tokenadmin.clone());
+    let program_id = String::from_str(&env, "decay-test");
+    
+    // Set initial time
+    env.ledger().set_timestamp(1000);
+    
+    // Operation 1 (Init): success
+    client.init_program(&program_id, &admin, &token_id);
+    assert_eq!(client.health_check().is_healthy, true);
+    
+    // Operation 2: Trigger error
+    // Since normal contract panics roll back the state, we directly inject a tracked failure
+    // as if a non-panicking internal check failed and tracked it.
+    env.as_contract(&contract_id, || {
+        crate::monitoring::track_operation(&env, symbol_short!("lock"), admin.clone(), false);
+    });
+    
+    // At this point in the window: 1 success, 1 failure -> 50% error rate
+    // Threshold is 50%, so it should trip the alert (is_healthy = false)
+    assert_eq!(client.health_check().is_healthy, false);
+    
+    let snap1 = client.get_state_snapshot();
+    assert_eq!(snap1.total_operations, 2);
+    assert_eq!(snap1.total_errors, 1);
+    
+    // Edge case: Metric right at the decay boundary (1 hour = 3600 seconds)
+    // At timestamp 1000 + 3599 = 4599, the window has NOT decayed
+    env.ledger().set_timestamp(4599);
+    assert_eq!(client.health_check().is_healthy, false);
+    
+    // Metric decays (window reset) at boundary: timestamp 1000 + 3600 = 4600
+    env.ledger().set_timestamp(4600);
+    
+    // Alert state clears due to decay of old metrics
+    assert_eq!(client.health_check().is_healthy, true);
+    
+    // The metric that should NEVER decay (ERROR_COUNT) is confirmed not to
+    let snap2 = client.get_state_snapshot();
+    assert_eq!(snap2.total_operations, 2);
+    assert_eq!(snap2.total_errors, 1);
+    
+    // Perform a new operation in the new window (success)
+    env.as_contract(&contract_id, || {
+        crate::monitoring::track_operation(&env, symbol_short!("lock"), admin.clone(), true);
+    });
+    
+    // Window now has 1 success, 0 errors -> 0% error rate
+    assert_eq!(client.health_check().is_healthy, true);
+    
+    // Overall metrics continue to accumulate
+    let snap3 = client.get_state_snapshot();
+    assert_eq!(snap3.total_operations, 3);
+    assert_eq!(snap3.total_errors, 1);
 }
+
+

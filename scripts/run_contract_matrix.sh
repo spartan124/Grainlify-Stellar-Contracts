@@ -209,7 +209,14 @@ build_and_test_workspace() {
     (
         cd "$SOROBAN_DIR"
         export CARGO_INCREMENTAL=0
-        cargo update
+        # Only update soroban-sdk and its direct/transitive deps — NOT the entire
+        # dep graph. A full `cargo update` resolves ed25519-dalek to v3.x which
+        # causes a trait-mismatch with soroban-env-host v23. By targeting only
+        # soroban-sdk we preserve the rest of the lockfile (including the
+        # ed25519-dalek 2.2.0 pin) while still picking up the requested SDK version.
+        cargo update soroban-sdk
+        # Safety net: if ed25519-dalek somehow bumped to 3.x, downgrade it.
+        cargo update -p ed25519-dalek --precise 2.2.0 2>/dev/null || true
         cargo test --workspace
         cargo build --release --target wasm32-unknown-unknown
     )

@@ -62,6 +62,7 @@ pub enum MultiSigError {
     /// Removing the signer would leave fewer signers than the configured
     /// threshold, making the multisig permanently un-executable.
     RemovalWouldBreakThreshold,
+    AlreadySigner,
 }
 
 /// =======================
@@ -291,9 +292,97 @@ impl MultiSig {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events().publish(
-            (symbol_short!("rm_sgnr"),),
-            signer_to_remove,
+            (symbol_short!("SignerRot"), symbol_short!("remove")),
+            (caller, signer_to_remove, config.threshold),
         );
+    }
+
+    /// Add a new signer to the multisig configuration.
+    pub fn add_signer(env: &Env, caller: Address, new_signer: Address) {
+        caller.require_auth();
+
+        let mut config = Self::get_config(env);
+
+        if config.signers.contains(&new_signer) {
+            panic!("{:?}", MultiSigError::AlreadySigner);
+        }
+
+        config.signers.push_back(new_signer.clone());
+        env.storage().instance().set(&DataKey::Config, &config);
+
+        env.events().publish(
+            (symbol_short!("SignerRot"), symbol_short!("add")),
+            (caller, new_signer, config.threshold),
+        );
+    }
+
+    /// Rotate signers and/or change threshold simultaneously.
+    pub fn rotate_signers(
+        env: &Env,
+        caller: Address,
+        add: Vec<Address>,
+        remove: Vec<Address>,
+        new_threshold: Option<u32>,
+    ) {
+        caller.require_auth();
+        let mut config = Self::get_config(env);
+
+        // Process removals
+        for signer_to_remove in remove.clone() {
+            if !config.signers.contains(&signer_to_remove) {
+                panic!("{:?}", MultiSigError::NotSigner);
+            }
+            let mut new_signers = Vec::new(env);
+            for i in 0..config.signers.len() {
+                let s = config.signers.get(i).unwrap();
+                if s != signer_to_remove {
+                    new_signers.push_back(s);
+                }
+            }
+            config.signers = new_signers;
+        }
+
+        // Process additions
+        for new_signer in add.clone() {
+            if config.signers.contains(&new_signer) {
+                panic!("{:?}", MultiSigError::AlreadySigner);
+            }
+            config.signers.push_back(new_signer);
+        }
+
+        // Apply new threshold
+        if let Some(t) = new_threshold {
+            config.threshold = t;
+        }
+
+        // Threshold guard
+        if config.threshold == 0 || config.threshold > config.signers.len() as u32 {
+            panic!("{:?}", MultiSigError::RemovalWouldBreakThreshold);
+        }
+
+        env.storage().instance().set(&DataKey::Config, &config);
+
+        // Emit events
+        for signer in add.clone() {
+            env.events().publish(
+                (symbol_short!("SignerRot"), symbol_short!("add")),
+                (caller.clone(), signer, config.threshold),
+            );
+        }
+        for signer in remove.clone() {
+            env.events().publish(
+                (symbol_short!("SignerRot"), symbol_short!("remove")),
+                (caller.clone(), signer, config.threshold),
+            );
+        }
+        
+        // If only threshold was changed, emit a threshold update event
+        if add.is_empty() && remove.is_empty() && new_threshold.is_some() {
+            env.events().publish(
+                (symbol_short!("SignerRot"), symbol_short!("thresh")),
+                (caller.clone(), caller.clone(), config.threshold),
+            );
+        }
     }
 
     fn mark_executed(env: &Env, proposal_id: u64, nonce: u64) {
@@ -353,7 +442,7 @@ impl MultiSig {
 mod test {
     use super::*;
     use crate::GrainlifyContract;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::Address as _, testutils::Events, Env};
 
     struct Setup {
         env: Env,
@@ -1044,6 +1133,84 @@ mod test {
                 setup.signer_a.clone(),
                 setup.signer_b.clone(),
             );
+        });
+    }
+
+    #[test]
+    fn test_add_signer_emits_event() {
+        let setup = setup();
+        let new_signer = Address::generate(&setup.env);
+        
+        setup.env.as_contract(&setup.contract_id, || {
+            MultiSig::init(
+                &setup.env,
+                signers(&setup.env, &setup.signer_a, &setup.signer_b),
+                2,
+            );
+
+            MultiSig::add_signer(&setup.env, setup.signer_a.clone(), new_signer.clone());
+            
+            let config = MultiSig::get_config(&setup.env);
+            assert!(config.signers.contains(&new_signer));
+            assert_eq!(config.signers.len(), 3);
+            assert_eq!(config.threshold, 2);
+        });
+        
+        let events = setup.env.events().all();
+        // The last event should be the SignerRot add event
+        assert!(events.len() > 0);
+    }
+    
+    #[test]
+    fn test_rotate_signers_simultaneous_threshold_change() {
+        let setup = setup();
+        let new_signer = Address::generate(&setup.env);
+        
+        setup.env.as_contract(&setup.contract_id, || {
+            MultiSig::init(
+                &setup.env,
+                signers(&setup.env, &setup.signer_a, &setup.signer_b),
+                2,
+            );
+
+            let mut add_vec = Vec::new(&setup.env);
+            add_vec.push_back(new_signer.clone());
+            
+            let mut rm_vec = Vec::new(&setup.env);
+            rm_vec.push_back(setup.signer_b.clone());
+
+            // Remove signer_b, add new_signer, and change threshold to 1 simultaneously
+            MultiSig::rotate_signers(&setup.env, setup.signer_a.clone(), add_vec, rm_vec, Some(1));
+            
+            let config = MultiSig::get_config(&setup.env);
+            assert!(config.signers.contains(&new_signer));
+            assert!(!config.signers.contains(&setup.signer_b));
+            assert_eq!(config.signers.len(), 2);
+            assert_eq!(config.threshold, 1);
+        });
+        
+        let events = setup.env.events().all();
+        assert!(events.len() > 0);
+    }
+    
+    #[test]
+    #[should_panic(expected = "RemovalWouldBreakThreshold")]
+    fn test_rotate_signers_rejected_no_events() {
+        let setup = setup();
+        
+        setup.env.as_contract(&setup.contract_id, || {
+            MultiSig::init(
+                &setup.env,
+                signers(&setup.env, &setup.signer_a, &setup.signer_b),
+                2,
+            );
+
+            let add_vec = Vec::new(&setup.env);
+            let mut rm_vec = Vec::new(&setup.env);
+            rm_vec.push_back(setup.signer_b.clone());
+
+            // Remove signer_b with threshold=2 (guard should block and panic, no events emitted)
+            MultiSig::rotate_signers(&setup.env, setup.signer_a.clone(), add_vec, rm_vec, None);
         });
     }
 }

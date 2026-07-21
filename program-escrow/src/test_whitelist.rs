@@ -235,3 +235,44 @@ fn test_batch_payout_enforcement_off_succeeds() {
     assert_eq!(token_client.balance(&r1), 10_000);
     assert_eq!(token_client.balance(&r2), 15_000);
 }
+
+#[test]
+fn test_whitelist_atomicity_prevents_mid_flight_removal_race() {
+    let env = Env::default();
+    let (client, _admin, token_client, _) = setup_whitelist_test(&env, 100_000);
+    let recipient = Address::generate(&env);
+
+    client.set_whitelist_enforced(&true);
+    
+    // DOCUMENTATION OF STRUCTURAL IMPOSSIBILITY:
+    // This test serves as a regression test asserting that whitelist-gated
+    // actions (like single_payout and batch_payout) are atomic, check-then-act 
+    // operations. There are no multi-step or multi-call flows spanning multiple
+    // contract invocations that are gated by the whitelist.
+    // 
+    // Because the whitelist check and the payout happen synchronously within 
+    // the same invocation, it is structurally impossible for an admin to remove
+    // a party from the whitelist "mid-flight" between steps of a flow.
+    // Either the party is whitelisted at the exact moment of the payout call 
+    // and receives funds, or they are not, and the transaction reverts.
+
+    // State 1: Recipient is not whitelisted. Atomic call fails immediately.
+    let res = client.try_single_payout(&recipient, &10_000);
+    assert!(res.is_err());
+    assert_eq!(token_client.balance(&recipient), 0);
+
+    // State 2: Admin adds recipient to whitelist.
+    client.set_whitelist(&recipient, &true);
+    
+    // Now the atomic call succeeds in a single step.
+    client.single_payout(&recipient, &10_000);
+    assert_eq!(token_client.balance(&recipient), 10_000);
+
+    // State 3: Admin removes recipient from whitelist.
+    // There is no "in-progress" flow to resume. Future atomic calls simply fail.
+    client.set_whitelist(&recipient, &false);
+    
+    let res2 = client.try_single_payout(&recipient, &10_000);
+    assert!(res2.is_err());
+    assert_eq!(token_client.balance(&recipient), 10_000); // Balance unchanged
+}
